@@ -1,0 +1,26 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# Compiled files
+*.o
+*.obj
+*.so
+*.a
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Coverage / profiling
+coverage/
+*.profraw
+*.profdata
+
+# Benchmark output
+benchmarks/results/
