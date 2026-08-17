@@ -1,5 +1,8 @@
 # Build
 build/
+build-sanitize/
+build-release/
+build-gprof/
 cmake-build-*/
 out/
 
