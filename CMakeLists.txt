@@ -7,7 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(MATCHING_ENGINE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(MATCHING_ENGINE_ENABLE_TSAN "Enable ThreadSanitizer for gateway concurrency tests" OFF)
 option(MATCHING_ENGINE_BUILD_BENCHMARKS "Build baseline benchmark and profiling executables" ON)
+
+if(MATCHING_ENGINE_ENABLE_SANITIZERS AND MATCHING_ENGINE_ENABLE_TSAN)
+    message(FATAL_ERROR "ASan/UBSan and ThreadSanitizer cannot be enabled in the same build")
+endif()
 
 add_library(matching_engine
     src/durable_engine.cpp
@@ -45,6 +50,18 @@ function(enable_project_sanitizers target)
     endif()
 endfunction()
 
+function(enable_project_thread_sanitizer target)
+    if(MATCHING_ENGINE_ENABLE_TSAN AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE
+            -fsanitize=thread
+            -fno-omit-frame-pointer
+        )
+        target_link_options(${target} PRIVATE
+            -fsanitize=thread
+        )
+    endif()
+endfunction()
+
 enable_project_warnings(matching_engine)
 enable_project_sanitizers(matching_engine)
 
@@ -52,6 +69,7 @@ enable_project_sanitizers(matching_engine)
 # it separate prevents future POSIX networking concerns from leaking into the
 # deterministic matching and durability core.
 add_library(matching_gateway
+    src/gateway_types.cpp
     src/wire_protocol.cpp
 )
 target_link_libraries(matching_gateway PUBLIC matching_engine)
@@ -61,6 +79,7 @@ target_include_directories(matching_gateway
 )
 enable_project_warnings(matching_gateway)
 enable_project_sanitizers(matching_gateway)
+enable_project_thread_sanitizer(matching_gateway)
 
 if(MATCHING_ENGINE_BUILD_BENCHMARKS)
     include(FetchContent)
@@ -102,6 +121,8 @@ include(CTest)
 if(BUILD_TESTING)
     include(FetchContent)
 
+    find_package(Threads REQUIRED)
+
     FetchContent_Declare(
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
@@ -117,6 +138,8 @@ if(BUILD_TESTING)
         tests/journal_storage_test.cpp
         tests/order_book_test.cpp
         tests/order_book_differential_test.cpp
+        tests/bounded_queue_test.cpp
+        tests/gateway_types_test.cpp
         tests/wire_protocol_test.cpp
     )
 
@@ -125,9 +148,12 @@ if(BUILD_TESTING)
             matching_engine
             matching_gateway
             GTest::gtest_main
+            Threads::Threads
     )
+    target_include_directories(matching_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     enable_project_warnings(matching_engine_tests)
     enable_project_sanitizers(matching_engine_tests)
+    enable_project_thread_sanitizer(matching_engine_tests)
 
     include(GoogleTest)
     gtest_add_tests(TARGET matching_engine_tests TEST_LIST matching_engine_test_cases)
