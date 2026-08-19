@@ -96,3 +96,14 @@ minimal correctness-only build, with `-DMATCHING_ENGINE_BUILD_BENCHMARKS=OFF`.
 
 For journal crash/recovery validation and the separate `DurableEngine` Release
 benchmark, see [`docs/persistence_performance.md`](docs/persistence_performance.md).
+
+For the full real-TCP `ExchangeServer` baseline (including direct durable
+comparison, latency percentiles, recovery checks, and multi-client scaling),
+run:
+
+```bash
+./build-release/network_exchange_benchmark --samples=100 --operations-per-client=32
+```
+
+See [`docs/network_performance.md`](docs/network_performance.md) for the
+methodology and host-specific recorded results.

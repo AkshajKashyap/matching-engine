@@ -85,6 +85,7 @@ enable_project_thread_sanitizer(matching_gateway)
 
 if(MATCHING_ENGINE_BUILD_BENCHMARKS)
     include(FetchContent)
+    find_package(Threads REQUIRED)
 
     set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
@@ -116,6 +117,13 @@ if(MATCHING_ENGINE_BUILD_BENCHMARKS)
     target_link_libraries(durable_engine_benchmark PRIVATE matching_engine benchmark::benchmark)
     enable_project_warnings(durable_engine_benchmark)
     enable_project_sanitizers(durable_engine_benchmark)
+
+    add_executable(network_exchange_benchmark
+        benchmarks/network_exchange_benchmark.cpp
+    )
+    target_link_libraries(network_exchange_benchmark PRIVATE matching_gateway Threads::Threads)
+    enable_project_warnings(network_exchange_benchmark)
+    enable_project_sanitizers(network_exchange_benchmark)
 endif()
 
 include(CTest)
