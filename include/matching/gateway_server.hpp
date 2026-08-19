@@ -15,6 +15,10 @@
 
 namespace matching {
 
+namespace testing {
+class GatewayServerTestAccess;
+}
+
 struct ServerConfig {
     std::string bind_address{"127.0.0.1"};
     std::uint16_t port{};
@@ -95,6 +99,7 @@ public:
     void enter_fail_stop() noexcept;
 
 private:
+    friend class testing::GatewayServerTestAccess;
     class Impl;
 
     explicit GatewayServer(std::unique_ptr<Impl> impl) noexcept;

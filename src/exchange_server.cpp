@@ -1,12 +1,30 @@
 #include "matching/exchange_server.hpp"
 
+#include "exchange_server_test_access.hpp"
+
 #include <exception>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 #include <utility>
 
 namespace matching {
 namespace {
+
+std::mutex test_hook_mutex;
+std::function<void()> before_execute_hook;
+
+void run_before_execute_hook() {
+    std::function<void()> hook;
+    {
+        std::lock_guard lock(test_hook_mutex);
+        hook = before_execute_hook;
+    }
+    if (hook) {
+        hook();
+    }
+}
 
 [[nodiscard]] EngineResponse unavailable_response(const EngineRequest& request) noexcept {
     return std::visit([](const auto& value) -> EngineResponse {
@@ -63,6 +81,7 @@ private:
     [[nodiscard]] EngineResponse execute(const EngineRequest& request, bool& failed) noexcept {
         if (failed) return unavailable_response(request);
         try {
+            run_before_execute_hook();
             return std::visit([this, &failed](const auto& value) -> EngineResponse {
                 using Request = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<Request, SubmitEngineRequest>) {
@@ -150,5 +169,34 @@ std::size_t ExchangeServer::maximum_observed_in_flight() const noexcept {
 }
 void ExchangeServer::run() { if (impl_ != nullptr) impl_->run(); }
 void ExchangeServer::request_stop() noexcept { if (impl_ != nullptr) impl_->request_stop(); }
+
+namespace testing {
+
+ExchangeServerRuntimeStats ExchangeServerTestAccess::stats(const ExchangeServer& server) noexcept {
+    if (server.impl_ == nullptr) {
+        return {};
+    }
+    const ExchangeServer::Impl& impl = *server.impl_;
+    return ExchangeServerRuntimeStats{
+        .in_flight = impl.in_flight_limiter.in_flight(),
+        .maximum_observed_in_flight = impl.in_flight_limiter.maximum_observed(),
+        .request_queue_size = impl.request_queue.size(),
+        .request_queue_capacity = impl.request_queue.capacity(),
+        .response_queue_size = impl.response_queue.size(),
+        .response_queue_capacity = impl.response_queue.capacity(),
+    };
+}
+
+void ExchangeServerTestAccess::set_before_execute_hook(std::function<void()> hook) {
+    std::lock_guard lock(test_hook_mutex);
+    before_execute_hook = std::move(hook);
+}
+
+void ExchangeServerTestAccess::clear_before_execute_hook() {
+    std::lock_guard lock(test_hook_mutex);
+    before_execute_hook = {};
+}
+
+} // namespace testing
 
 } // namespace matching

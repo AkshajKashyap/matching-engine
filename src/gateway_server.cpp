@@ -1,6 +1,7 @@
 #include "matching/gateway_server.hpp"
 
 #include "connection.hpp"
+#include "gateway_server_test_access.hpp"
 
 #include <array>
 #include <cerrno>
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <poll.h>
@@ -27,6 +29,20 @@ namespace matching {
 namespace {
 constexpr std::size_t kReceiveBufferSize = 4096;
 constexpr std::size_t kMaximumPendingRequests = 4096;
+
+std::mutex response_drain_hook_mutex;
+std::function<void()> before_response_drain_hook;
+
+void run_before_response_drain_hook() {
+    std::function<void()> hook;
+    {
+        std::lock_guard lock(response_drain_hook_mutex);
+        hook = before_response_drain_hook;
+    }
+    if (hook) {
+        hook();
+    }
+}
 
 [[nodiscard]] GatewayServerError make_error(GatewayServerErrorCode code, int error_number) {
     return GatewayServerError{.code = code, .system_error = std::error_code(error_number, std::generic_category())};
@@ -280,6 +296,9 @@ private:
     }
     void drain_engine_completions() {
         if (response_queue == nullptr) return;
+        if (response_queue->size() != 0U) {
+            run_before_response_drain_hook();
+        }
         while (std::optional<EngineCompletion> completion = response_queue->try_pop()) {
             if (Connection* connection = find_connection(response_connection_id(completion->response));
                 connection != nullptr && !connection->closing) {
@@ -364,4 +383,18 @@ void GatewayServer::run() { if (impl_ != nullptr) impl_->run(); }
 void GatewayServer::request_stop() noexcept { if (impl_ != nullptr) impl_->request_stop(); }
 void GatewayServer::notify() noexcept { if (impl_ != nullptr) impl_->wake(); }
 void GatewayServer::enter_fail_stop() noexcept { if (impl_ != nullptr) impl_->enter_fail_stop(); }
+
+namespace testing {
+
+void GatewayServerTestAccess::set_before_response_drain_hook(std::function<void()> hook) {
+    std::lock_guard lock(response_drain_hook_mutex);
+    before_response_drain_hook = std::move(hook);
+}
+
+void GatewayServerTestAccess::clear_before_response_drain_hook() {
+    std::lock_guard lock(response_drain_hook_mutex);
+    before_response_drain_hook = {};
+}
+
+} // namespace testing
 } // namespace matching

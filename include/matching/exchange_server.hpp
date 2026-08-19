@@ -13,6 +13,10 @@
 
 namespace matching {
 
+namespace testing {
+class ExchangeServerTestAccess;
+}
+
 enum class ExchangeStartupMode : std::uint8_t {
     CreateNew,
     Recover,
@@ -63,6 +67,7 @@ public:
     void request_stop() noexcept;
 
 private:
+    friend class testing::ExchangeServerTestAccess;
     class Impl;
     explicit ExchangeServer(std::unique_ptr<Impl> impl) noexcept;
 

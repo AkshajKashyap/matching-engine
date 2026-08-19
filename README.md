@@ -44,6 +44,14 @@ ambiguous. There is intentionally no request deduplication or exactly-once
 guarantee. A persistence failure puts the server into fail-stop mode: it stops
 new admission and completes already admitted queued requests as unavailable.
 
+The default test suite also includes bounded four-client TCP stress (1,024
+fragmented commands), deterministic admission backpressure, slow/dead-client
+isolation, WAL failure fail-stop, graceful draining, and repeated recovery.
+The journal is used as the authoritative command order for concurrent replay
+verification. ThreadSanitizer is configured but cannot execute in the current
+WSL host because its runtime aborts before tests start with `unexpected memory
+mapping`; run that configuration on a TSan-compatible native Linux host.
+
 ## Build and test
 
 ```bash
