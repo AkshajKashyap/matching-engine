@@ -23,6 +23,27 @@ A caller timeout after a command may still be ambiguous: a command can be
 durably committed before its result reaches the caller. There is no exactly-once
 client protocol or request deduplication yet.
 
+## Network execution path
+
+`ExchangeServer` provides the current TCP runtime boundary. It starts in an
+explicit create-new or recover-existing mode; recovery never falls back to a
+fresh journal. The caller of `run()` owns the poll-based gateway thread, while
+exactly one private worker owns `DurableEngine` and its mutable `OrderBook`:
+
+```text
+TCP request -> parser -> bounded admission -> engine worker
+            -> WAL append + fsync -> OrderBook -> response queue
+            -> gateway -> TCP response
+```
+
+Cross-client command order is successful bounded-queue admission order. A
+command admitted before a client disconnects still executes and is journaled;
+its response is simply discarded if that connection is gone. A successful
+response follows durable commit, but a client timeout or disconnect remains
+ambiguous. There is intentionally no request deduplication or exactly-once
+guarantee. A persistence failure puts the server into fail-stop mode: it stops
+new admission and completes already admitted queued requests as unavailable.
+
 ## Build and test
 
 ```bash

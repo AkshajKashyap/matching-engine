@@ -67,7 +67,14 @@ public:
         ServerConfig config,
         InFlightLimiter& in_flight_limiter,
         gateway_detail::BoundedQueue<AdmittedEngineRequest>& request_queue,
+        gateway_detail::BoundedQueue<EngineCompletion>* response_queue = nullptr,
         testing::GatewayResponseHook response_hook = {});
+
+    [[nodiscard]] static CreateResult create(
+        ServerConfig config,
+        InFlightLimiter& in_flight_limiter,
+        gateway_detail::BoundedQueue<AdmittedEngineRequest>& request_queue,
+        testing::GatewayResponseHook response_hook);
 
     [[nodiscard]] std::uint16_t local_port() const noexcept;
 
@@ -78,6 +85,14 @@ public:
     // Thread-safe and idempotent. The eventfd wakeup is also the future path
     // for waking poll() when engine responses become available.
     void request_stop() noexcept;
+
+    // Thread-safe notification used by the sole engine worker after it has
+    // published completions. It does not touch socket state.
+    void notify() noexcept;
+
+    // Thread-safe terminal transition for a poisoned DurableEngine. The
+    // gateway stops admission and lets the worker drain admitted commands.
+    void enter_fail_stop() noexcept;
 
 private:
     class Impl;

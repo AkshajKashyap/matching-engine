@@ -69,6 +69,7 @@ enable_project_sanitizers(matching_engine)
 # it separate prevents future POSIX networking concerns from leaking into the
 # deterministic matching and durability core.
 add_library(matching_gateway
+    src/exchange_server.cpp
     src/gateway_server.cpp
     src/gateway_types.cpp
     src/wire_protocol.cpp
@@ -142,6 +143,7 @@ if(BUILD_TESTING)
         tests/bounded_queue_test.cpp
         tests/gateway_types_test.cpp
         tests/gateway_server_test.cpp
+        tests/exchange_server_test.cpp
         tests/wire_protocol_test.cpp
     )
 

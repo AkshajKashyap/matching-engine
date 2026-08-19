@@ -35,6 +35,11 @@ public:
         return bytes_.size() - offset_;
     }
 
+    void clear() noexcept {
+        bytes_.clear();
+        offset_ = 0;
+    }
+
     template <typename SendFunction>
     [[nodiscard]] OutputFlushResult flush(SendFunction&& send_function) {
         while (!empty()) {
