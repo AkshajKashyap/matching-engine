@@ -48,6 +48,20 @@ endfunction()
 enable_project_warnings(matching_engine)
 enable_project_sanitizers(matching_engine)
 
+# The gateway layer currently contains only a pure binary wire codec. Keeping
+# it separate prevents future POSIX networking concerns from leaking into the
+# deterministic matching and durability core.
+add_library(matching_gateway
+    src/wire_protocol.cpp
+)
+target_link_libraries(matching_gateway PUBLIC matching_engine)
+target_include_directories(matching_gateway
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+enable_project_warnings(matching_gateway)
+enable_project_sanitizers(matching_gateway)
+
 if(MATCHING_ENGINE_BUILD_BENCHMARKS)
     include(FetchContent)
 
@@ -103,11 +117,13 @@ if(BUILD_TESTING)
         tests/journal_storage_test.cpp
         tests/order_book_test.cpp
         tests/order_book_differential_test.cpp
+        tests/wire_protocol_test.cpp
     )
 
     target_link_libraries(matching_engine_tests
         PRIVATE
             matching_engine
+            matching_gateway
             GTest::gtest_main
     )
     enable_project_warnings(matching_engine_tests)
