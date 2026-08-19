@@ -1,5 +1,7 @@
 # C++ Matching Engine
 
+[![CI](https://github.com/AkshajKashyap/matching-engine/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/AkshajKashyap/matching-engine/actions/workflows/ci.yml)
+
 This project is building a deterministic, single-threaded, in-memory C++ limit
 order book using price-time priority.
 
@@ -51,6 +53,11 @@ The journal is used as the authoritative command order for concurrent replay
 verification. ThreadSanitizer is configured but cannot execute in the current
 WSL host because its runtime aborts before tests start with `unexpected memory
 mapping`; run that configuration on a TSan-compatible native Linux host.
+
+GitHub Actions is configured to run the full suite on native Ubuntu for normal,
+ASan/UBSan, and ThreadSanitizer builds. This is the authoritative TSan
+environment: WSL2 still cannot start the TSan runtime because of the documented
+mapping failure.
 
 ## Build and test
 
