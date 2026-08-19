@@ -11,6 +11,18 @@ The engine is validated with deterministic differential traces against a
 separate test-only reference model. AddressSanitizer and UndefinedBehaviorSanitizer
 can be enabled for a Debug build with `-DMATCHING_ENGINE_ENABLE_SANITIZERS=ON`.
 
+## Durable journal boundary
+
+`DurableEngine` owns the persistence boundary: every submit or cancellation is
+appended and fsynced before it is applied to the `OrderBook`. The journal is
+authoritative, including commands that the book rejects semantically. Recovery
+constructs a fresh book and replays the validated journal without writing new
+frames. An incomplete final frame is repaired; complete corruption is fatal.
+
+A caller timeout after a command may still be ambiguous: a command can be
+durably committed before its result reaches the caller. There is no exactly-once
+client protocol or request deduplication yet.
+
 ## Build and test
 
 ```bash

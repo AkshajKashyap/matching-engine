@@ -10,6 +10,9 @@ option(MATCHING_ENGINE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedB
 option(MATCHING_ENGINE_BUILD_BENCHMARKS "Build baseline benchmark and profiling executables" ON)
 
 add_library(matching_engine
+    src/durable_engine.cpp
+    src/journal.cpp
+    src/journal_storage.cpp
     src/order_book.cpp
 )
 
@@ -87,6 +90,9 @@ if(BUILD_TESTING)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(matching_engine_tests
+        tests/durable_engine_test.cpp
+        tests/journal_test.cpp
+        tests/journal_storage_test.cpp
         tests/order_book_test.cpp
         tests/order_book_differential_test.cpp
     )
