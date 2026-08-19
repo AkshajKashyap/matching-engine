@@ -74,6 +74,13 @@ if(MATCHING_ENGINE_BUILD_BENCHMARKS)
     target_link_libraries(order_book_profile_workload PRIVATE matching_engine)
     enable_project_warnings(order_book_profile_workload)
     enable_project_sanitizers(order_book_profile_workload)
+
+    add_executable(durable_engine_benchmark
+        benchmarks/durable_engine_benchmark.cpp
+    )
+    target_link_libraries(durable_engine_benchmark PRIVATE matching_engine benchmark::benchmark)
+    enable_project_warnings(durable_engine_benchmark)
+    enable_project_sanitizers(durable_engine_benchmark)
 endif()
 
 include(CTest)
@@ -91,6 +98,7 @@ if(BUILD_TESTING)
 
     add_executable(matching_engine_tests
         tests/durable_engine_test.cpp
+        tests/durable_engine_stress_test.cpp
         tests/journal_test.cpp
         tests/journal_storage_test.cpp
         tests/order_book_test.cpp

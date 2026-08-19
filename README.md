@@ -57,3 +57,6 @@ perf record -g -- ./build-release/order_book_profile_workload
 [`docs/performance_baseline.md`](docs/performance_baseline.md) for the recorded
 baseline and measurement caveats. Disable benchmark targets, for example in a
 minimal correctness-only build, with `-DMATCHING_ENGINE_BUILD_BENCHMARKS=OFF`.
+
+For journal crash/recovery validation and the separate `DurableEngine` Release
+benchmark, see [`docs/persistence_performance.md`](docs/persistence_performance.md).
