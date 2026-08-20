@@ -124,6 +124,7 @@ if(MATCHING_ENGINE_BUILD_BENCHMARKS)
     target_link_libraries(network_exchange_benchmark PRIVATE matching_gateway Threads::Threads)
     enable_project_warnings(network_exchange_benchmark)
     enable_project_sanitizers(network_exchange_benchmark)
+    enable_project_thread_sanitizer(network_exchange_benchmark)
 endif()
 
 include(CTest)
