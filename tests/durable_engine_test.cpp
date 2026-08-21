@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iterator>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -20,6 +21,8 @@
 
 #include <gtest/gtest.h>
 
+#include "durable_engine_test_access.hpp"
+#include "journal_storage_test_access.hpp"
 #include "matching/durable_engine.hpp"
 #include "order_book_test_access.hpp"
 
@@ -137,6 +140,8 @@ void write_all_or_fail(const std::filesystem::path& path, std::span<const std::b
 class DurableEngineTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        testing::DurableEngineTestAccess::clear_before_batch_apply_hook();
+        testing::JournalStorageTestAccess::reset_append_io();
         std::array<char, 64> template_path{};
         constexpr char kPattern[] = "/tmp/matching-engine-durable-XXXXXX";
         std::copy(std::begin(kPattern), std::end(kPattern), template_path.begin());
@@ -147,6 +152,8 @@ protected:
     }
 
     void TearDown() override {
+        testing::DurableEngineTestAccess::clear_before_batch_apply_hook();
+        testing::JournalStorageTestAccess::reset_append_io();
         std::error_code error;
         std::filesystem::remove_all(temporary_directory_, error);
         EXPECT_FALSE(error);
@@ -434,6 +441,117 @@ TEST_F(DurableEngineTest, JournalFailurePreventsApplicationAndPoisonsEngine) {
     const auto later_cancel = engine.cancel(OrderId{1});
     ASSERT_TRUE(std::holds_alternative<DurableEngineError>(later_cancel));
     EXPECT_EQ(std::get<DurableEngineError>(later_cancel).code, DurableEngineErrorCode::EngineFailed);
+}
+
+TEST_F(DurableEngineTest, BatchExecutionMatchesOrderedSingleCommandSemanticsAndRecovery) {
+    const std::vector<JournalCommand> commands{
+        SubmitLimitOrderCommand{.order = order(1, Side::Sell, 100, 2)},
+        SubmitLimitOrderCommand{.order = order(2, Side::Buy, 100, 1)},
+        SubmitLimitOrderCommand{.order = order(2, Side::Buy, 90, 1)},
+        SubmitLimitOrderCommand{.order = order(3, Side::Buy, 90, 0)},
+        CancelOrderCommand{.order_id = OrderId{1}},
+        CancelOrderCommand{.order_id = OrderId{999}},
+    };
+    auto created = DurableEngine::create(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<DurableEngine>(created));
+    DurableEngine engine = std::move(std::get<DurableEngine>(created));
+    const DurableEngine::BatchResult result = engine.execute_batch(commands);
+    ASSERT_TRUE(std::holds_alternative<std::vector<DurableEngine::BatchCommandResult>>(result));
+    const auto& results = std::get<std::vector<DurableEngine::BatchCommandResult>>(result);
+    ASSERT_EQ(results.size(), commands.size());
+    EXPECT_TRUE(std::get<SubmitResult>(results[0]).accepted());
+    EXPECT_EQ(std::get<SubmitResult>(results[1]).executed_quantity, Quantity{1});
+    EXPECT_EQ(std::get<SubmitResult>(results[2]).rejection_reason, RejectionReason::DuplicateOrderId);
+    EXPECT_EQ(std::get<SubmitResult>(results[3]).rejection_reason, RejectionReason::InvalidQuantity);
+    EXPECT_EQ(std::get<CancelResult>(results[4]).status, CancelStatus::Cancelled);
+    EXPECT_EQ(std::get<CancelResult>(results[5]).status, CancelStatus::NotFound);
+
+    auto recovered_result = DurableEngine::recover(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<DurableEngine>(recovered_result));
+    DurableEngine recovered = std::move(std::get<DurableEngine>(recovered_result));
+    expect_book_equal(engine.order_book(), recovered.order_book(), {OrderId{1}, OrderId{2}, OrderId{3}});
+    const JournalScanResult scan = JournalReader::scan(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<JournalScan>(scan));
+    ASSERT_EQ(std::get<JournalScan>(scan).records.size(), commands.size());
+    for (std::size_t index = 0; index < commands.size(); ++index) {
+        EXPECT_EQ(std::get<JournalScan>(scan).records[index].sequence,
+            JournalSequence{static_cast<std::uint64_t>(index + 1U)});
+    }
+}
+
+TEST_F(DurableEngineTest, WriteAndSyncFailuresNeverApplyTheLiveBatchAndRecoverActualWalPrefix) {
+    const std::array<JournalCommand, 3> commands{
+        SubmitLimitOrderCommand{.order = order(1, Side::Buy, 101, 1)},
+        SubmitLimitOrderCommand{.order = order(2, Side::Buy, 102, 1)},
+        SubmitLimitOrderCommand{.order = order(3, Side::Buy, 103, 1)},
+    };
+    const std::size_t first_frame_size = encoded_record_or_failure(JournalSequence{1}, commands[0]).size();
+
+    const auto verify_failure = [&](const std::filesystem::path& path, bool fail_sync, std::size_t expected_recovered) {
+        {
+            auto created = DurableEngine::create(path);
+            ASSERT_TRUE(std::holds_alternative<DurableEngine>(created));
+            DurableEngine engine = std::move(std::get<DurableEngine>(created));
+            if (fail_sync) {
+                testing::JournalStorageTestAccess::fail_next_append_sync();
+            } else {
+                testing::JournalStorageTestAccess::fail_append_write_after(first_frame_size / 2U);
+            }
+            const DurableEngine::BatchResult result = engine.execute_batch(commands);
+            ASSERT_TRUE(std::holds_alternative<DurableEngineError>(result));
+            EXPECT_EQ(std::get<DurableEngineError>(result).code, DurableEngineErrorCode::JournalFailure);
+            EXPECT_EQ(engine.state(), DurableEngineState::Failed);
+            EXPECT_EQ(engine.order_book().active_order_count(), 0U);
+            const auto later = engine.submit(order(99, Side::Buy, 99, 1));
+            ASSERT_TRUE(std::holds_alternative<DurableEngineError>(later));
+            EXPECT_EQ(std::get<DurableEngineError>(later).code, DurableEngineErrorCode::EngineFailed);
+        }
+        auto recovered_result = DurableEngine::recover(path);
+        ASSERT_TRUE(std::holds_alternative<DurableEngine>(recovered_result));
+        EXPECT_EQ(std::get<DurableEngine>(recovered_result).order_book().active_order_count(), expected_recovered);
+        testing::JournalStorageTestAccess::reset_append_io();
+    };
+
+    verify_failure(temporary_directory_ / "mid-write.bin", false, 0U);
+    verify_failure(temporary_directory_ / "post-write-sync.bin", true, commands.size());
+}
+
+TEST_F(DurableEngineTest, PostSyncApplicationFailurePoisonsLiveEngineButRecoveryReplaysEntireBatch) {
+    const std::array<JournalCommand, 3> commands{
+        SubmitLimitOrderCommand{.order = order(1, Side::Buy, 101, 1)},
+        SubmitLimitOrderCommand{.order = order(2, Side::Buy, 102, 1)},
+        SubmitLimitOrderCommand{.order = order(3, Side::Sell, 110, 1)},
+    };
+    OrderBook expected;
+    static_cast<void>(expected.submit(order(1, Side::Buy, 101, 1)));
+    static_cast<void>(expected.submit(order(2, Side::Buy, 102, 1)));
+    static_cast<void>(expected.submit(order(3, Side::Sell, 110, 1)));
+
+    {
+        auto created = DurableEngine::create(journal_path_);
+        ASSERT_TRUE(std::holds_alternative<DurableEngine>(created));
+        DurableEngine engine = std::move(std::get<DurableEngine>(created));
+        testing::DurableEngineTestAccess::set_before_batch_apply_hook([](std::size_t index) {
+            if (index == 1U) throw std::runtime_error("injected post-sync application failure");
+        });
+        const DurableEngine::BatchResult result = engine.execute_batch(commands);
+        ASSERT_TRUE(std::holds_alternative<DurableEngineError>(result));
+        EXPECT_EQ(std::get<DurableEngineError>(result).code, DurableEngineErrorCode::ApplicationFailure);
+        EXPECT_EQ(engine.state(), DurableEngineState::Failed);
+        ASSERT_TRUE(engine.order_book().find(OrderId{1}).has_value());
+        EXPECT_FALSE(engine.order_book().find(OrderId{2}).has_value());
+        const auto later_cancel = engine.cancel(OrderId{1});
+        ASSERT_TRUE(std::holds_alternative<DurableEngineError>(later_cancel));
+        EXPECT_EQ(std::get<DurableEngineError>(later_cancel).code, DurableEngineErrorCode::EngineFailed);
+        testing::DurableEngineTestAccess::clear_before_batch_apply_hook();
+    }
+
+    const JournalScanResult scan_result = JournalReader::scan(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<JournalScan>(scan_result));
+    ASSERT_EQ(std::get<JournalScan>(scan_result).records.size(), commands.size());
+    auto recovered_result = DurableEngine::recover(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<DurableEngine>(recovered_result));
+    expect_book_equal(expected, std::get<DurableEngine>(recovered_result).order_book(), {OrderId{1}, OrderId{2}, OrderId{3}});
 }
 
 } // namespace

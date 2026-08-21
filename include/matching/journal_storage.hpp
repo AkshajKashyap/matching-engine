@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <system_error>
 #include <variant>
 #include <vector>
@@ -27,6 +28,7 @@ enum class JournalStorageErrorCode : std::uint8_t {
     NoTruncatedTail,
     WriterFailed,
     CodecFailure,
+    EmptyBatch,
 };
 
 struct JournalStorageError {
@@ -45,6 +47,7 @@ struct JournalScan {
 
 using JournalScanResult = std::variant<JournalScan, JournalStorageError>;
 using JournalAppendResult = std::variant<JournalSequence, JournalStorageError>;
+using JournalAppendBatchResult = std::variant<std::vector<JournalSequence>, JournalStorageError>;
 
 class JournalReader {
 public:
@@ -73,6 +76,11 @@ public:
 
     // A failed write or sync permanently fails this writer. Reopen through recovery before use.
     [[nodiscard]] JournalAppendResult append_and_sync(const JournalCommand& command);
+
+    // Prepares every frame, writes them in order, then performs exactly one fsync.
+    // A failed write or sync permanently fails this writer.
+    [[nodiscard]] JournalAppendBatchResult append_batch_and_sync(
+        std::span<const JournalCommand> commands);
 
     [[nodiscard]] std::optional<JournalSequence> next_sequence() const noexcept;
     [[nodiscard]] bool failed() const noexcept;

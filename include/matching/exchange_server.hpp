@@ -26,6 +26,7 @@ struct ExchangeServerConfig {
     ServerConfig gateway{};
     std::size_t maximum_in_flight{256};
     std::size_t request_queue_capacity{256};
+    std::size_t max_durable_batch_size{1};
 };
 
 enum class ExchangeServerErrorCode : std::uint8_t {

@@ -27,6 +27,8 @@
 #include "matching/journal_storage.hpp"
 #include "matching/wire_protocol.hpp"
 
+#include "exchange_server_test_access.hpp"
+
 namespace matching {
 namespace {
 
@@ -179,9 +181,11 @@ private:
 
 class ExchangeHarness {
 public:
-    ExchangeHarness() {
+    explicit ExchangeHarness(std::size_t max_durable_batch_size = 1) {
+        ExchangeServerConfig config;
+        config.max_durable_batch_size = max_durable_batch_size;
         ExchangeServer::CreateResult created = ExchangeServer::create(
-            {}, journal_.path(), ExchangeStartupMode::CreateNew);
+            config, journal_.path(), ExchangeStartupMode::CreateNew);
         if (!std::holds_alternative<ExchangeServer>(created)) {
             std::abort();
         }
@@ -192,20 +196,22 @@ public:
     ExchangeHarness(const ExchangeHarness&) = delete;
     ExchangeHarness& operator=(const ExchangeHarness&) = delete;
 
-    ~ExchangeHarness() { stop_and_verify(0, false); }
+    ~ExchangeHarness() { static_cast<void>(stop_and_verify(0, false)); }
 
     [[nodiscard]] NetworkClient connect_client() const { return NetworkClient{server_->local_port()}; }
 
-    void stop_and_verify(std::size_t expected_records, bool verify_records = true) {
+    [[nodiscard]] testing::ExchangeBatchStats stop_and_verify(
+        std::size_t expected_records, bool verify_records = true) {
         if (!server_.has_value()) {
-            return;
+            return {};
         }
         server_->request_stop();
         gateway_thread_->join();
         gateway_thread_.reset();
+        const testing::ExchangeBatchStats stats = testing::ExchangeServerTestAccess::batch_stats(*server_);
         server_.reset();
         if (!verify_records) {
-            return;
+            return stats;
         }
         const JournalScanResult scan_result = JournalReader::scan(journal_.path());
         if (!std::holds_alternative<JournalScan>(scan_result) ||
@@ -216,6 +222,7 @@ public:
         if (!std::holds_alternative<DurableEngine>(recovered)) {
             std::abort();
         }
+        return stats;
     }
 
 private:
@@ -230,6 +237,11 @@ struct Summary {
     double p95_us{};
     double p99_us{};
     double operations_per_second{};
+};
+
+struct ThroughputSummary {
+    Summary summary;
+    testing::ExchangeBatchStats batch_stats;
 };
 
 [[nodiscard]] Summary summarize(std::vector<Nanoseconds> samples, Nanoseconds elapsed) {
@@ -291,7 +303,7 @@ template <typename Operation>
     for (std::size_t index = 0; index < samples; ++index) {
         measurements.push_back(operation(client, index, true));
     }
-    exchange.stop_and_verify(journal_records + 10U * (journal_records / samples));
+    static_cast<void>(exchange.stop_and_verify(journal_records + 10U * (journal_records / samples)));
     return summarize(measurements, total_duration(measurements));
 }
 
@@ -454,12 +466,13 @@ template <typename Operation>
         measurements.push_back(client.round_trip(submit_frame(id + 2U, id + 2U, Side::Buy, 90, 1), RequestId{id + 2U}));
         measurements.push_back(client.round_trip(cancel_frame(id + 3U, id + 2U), RequestId{id + 3U}));
     }
-    exchange.stop_and_verify((samples + 10U) * 4U);
+    static_cast<void>(exchange.stop_and_verify((samples + 10U) * 4U));
     return summarize(measurements, total_duration(measurements));
 }
 
-[[nodiscard]] Summary tcp_passive_throughput(std::size_t client_count, std::size_t operations_per_client) {
-    ExchangeHarness exchange;
+[[nodiscard]] ThroughputSummary tcp_passive_throughput(
+    std::size_t client_count, std::size_t operations_per_client, std::size_t max_durable_batch_size) {
+    ExchangeHarness exchange{max_durable_batch_size};
     std::barrier ready(static_cast<std::ptrdiff_t>(client_count + 1U));
     std::vector<std::vector<Nanoseconds>> measurements(client_count);
     std::vector<std::jthread> clients;
@@ -483,8 +496,63 @@ template <typename Operation>
     for (auto& client_measurements : measurements) {
         flattened.insert(flattened.end(), client_measurements.begin(), client_measurements.end());
     }
-    exchange.stop_and_verify(client_count * operations_per_client);
-    return summarize(std::move(flattened), elapsed);
+    const auto batch_stats = exchange.stop_and_verify(client_count * operations_per_client);
+    return ThroughputSummary{.summary = summarize(std::move(flattened), elapsed), .batch_stats = batch_stats};
+}
+
+[[nodiscard]] ThroughputSummary tcp_mixed_throughput(
+    std::size_t client_count, std::size_t operations_per_client, std::size_t max_durable_batch_size) {
+    if (operations_per_client % 4U != 0U) std::abort();
+    const std::size_t blocks_per_client = operations_per_client / 4U;
+    ExchangeHarness exchange{max_durable_batch_size};
+    std::barrier ready(static_cast<std::ptrdiff_t>(client_count + 1U));
+    std::vector<std::vector<Nanoseconds>> measurements(client_count);
+    std::vector<std::jthread> clients;
+    clients.reserve(client_count);
+    for (std::size_t client_index = 0; client_index < client_count; ++client_index) {
+        clients.emplace_back([&, client_index] {
+            NetworkClient client = exchange.connect_client();
+            ready.arrive_and_wait();
+            const std::uint64_t client_base = 200'000U + static_cast<std::uint64_t>(client_index) * 100'000U;
+            for (std::size_t block = 0; block < blocks_per_client; ++block) {
+                const std::uint64_t id = client_base + static_cast<std::uint64_t>(block) * 4U;
+                const std::uint64_t request = static_cast<std::uint64_t>(block) * 4U;
+                measurements[client_index].push_back(client.round_trip(
+                    submit_frame(request, id, Side::Sell, 100, 2), RequestId{request}));
+                measurements[client_index].push_back(client.round_trip(
+                    submit_frame(request + 1U, id + 1U, Side::Buy, 100, 1), RequestId{request + 1U}));
+                measurements[client_index].push_back(client.round_trip(
+                    submit_frame(request + 2U, id + 2U, Side::Buy, 90, 1), RequestId{request + 2U}));
+                measurements[client_index].push_back(client.round_trip(
+                    cancel_frame(request + 3U, id + 2U), RequestId{request + 3U}));
+            }
+        });
+    }
+    ready.arrive_and_wait();
+    const auto started = Clock::now();
+    for (auto& client : clients) client.join();
+    const auto elapsed = std::chrono::duration_cast<Nanoseconds>(Clock::now() - started);
+    std::vector<Nanoseconds> flattened;
+    for (auto& client_measurements : measurements) {
+        flattened.insert(flattened.end(), client_measurements.begin(), client_measurements.end());
+    }
+    const auto batch_stats = exchange.stop_and_verify(client_count * operations_per_client);
+    return ThroughputSummary{.summary = summarize(std::move(flattened), elapsed), .batch_stats = batch_stats};
+}
+
+void print_batch_stats(std::size_t max_durable_batch_size, const testing::ExchangeBatchStats& stats) {
+    const double mean = stats.batches_processed == 0U ? 0.0
+        : static_cast<double>(stats.commands_processed) / static_cast<double>(stats.batches_processed);
+    std::cout << "batch_stats," << max_durable_batch_size << ',' << stats.commands_processed << ','
+              << stats.batches_processed << ',' << mean << ',';
+    bool first = true;
+    for (std::size_t size = 1; size < stats.batch_size_histogram.size(); ++size) {
+        if (stats.batch_size_histogram[size] == 0U) continue;
+        if (!first) std::cout << ';';
+        std::cout << size << ':' << stats.batch_size_histogram[size];
+        first = false;
+    }
+    std::cout << '\n';
 }
 
 [[nodiscard]] std::size_t parse_size_argument(int argc, char** argv, std::string_view name, std::size_t fallback) {
@@ -501,12 +569,26 @@ template <typename Operation>
     return fallback;
 }
 
+[[nodiscard]] std::string_view parse_string_argument(
+    int argc, char** argv, std::string_view name, std::string_view fallback) {
+    const std::string prefix = "--" + std::string{name} + "=";
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument{argv[index]};
+        if (argument.starts_with(prefix)) return argument.substr(prefix.size());
+    }
+    return fallback;
+}
+
 } // namespace
 } // namespace matching
 
 int main(int argc, char** argv) {
     const std::size_t samples = matching::parse_size_argument(argc, argv, "samples", 100);
     const std::size_t operations_per_client = matching::parse_size_argument(argc, argv, "operations-per-client", 32);
+    const std::size_t max_durable_batch_size = matching::parse_size_argument(argc, argv, "max-durable-batch-size", 1);
+    const std::string_view throughput_workload = matching::parse_string_argument(
+        argc, argv, "throughput-workload", "passive");
+    if (throughput_workload != "passive" && throughput_workload != "mixed") std::abort();
     std::cout << "workload,samples,p50_us,p95_us,p99_us,operations_per_second\n";
     const auto direct_passive = matching::direct_passive(samples);
     const auto direct_aggressive = matching::direct_aggressive(samples);
@@ -528,10 +610,18 @@ int main(int argc, char** argv) {
     matching::print_summary("tcp_cancel", tcp_cancel);
     matching::print_summary("tcp_rejected", tcp_rejected);
     matching::print_summary("tcp_mixed", tcp_mixed);
-    for (const std::size_t clients : {1U, 2U, 4U, 8U, 16U}) {
+    const std::vector<std::size_t> client_counts = throughput_workload == "passive"
+        ? std::vector<std::size_t>{1U, 2U, 4U, 8U, 16U}
+        : std::vector<std::size_t>{4U, 16U};
+    for (const std::size_t clients : client_counts) {
+        const auto throughput = throughput_workload == "passive"
+            ? matching::tcp_passive_throughput(clients, operations_per_client, max_durable_batch_size)
+            : matching::tcp_mixed_throughput(clients, operations_per_client, max_durable_batch_size);
         matching::print_summary(
-            "tcp_passive_" + std::to_string(clients) + "_clients",
-            matching::tcp_passive_throughput(clients, operations_per_client));
+            "tcp_" + std::string(throughput_workload) + "_batch_" + std::to_string(max_durable_batch_size) + "_" +
+                std::to_string(clients) + "_clients",
+            throughput.summary);
+        matching::print_batch_stats(max_durable_batch_size, throughput.batch_stats);
     }
     return 0;
 }

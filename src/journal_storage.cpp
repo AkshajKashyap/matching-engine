@@ -1,10 +1,15 @@
 #include "matching/journal_storage.hpp"
 
+#include "journal_storage_test_access.hpp"
+
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -18,6 +23,58 @@
 
 namespace matching {
 namespace {
+
+struct AppendIoTestState {
+    std::mutex mutex;
+    std::optional<std::size_t> fail_after_successful_bytes;
+    bool fail_next_sync{};
+    std::size_t successful_append_sync_count{};
+    std::size_t successful_append_bytes{};
+};
+
+AppendIoTestState append_io_test_state;
+std::atomic<bool> append_io_test_active{false};
+
+[[nodiscard]] JournalStorageError make_error(
+    JournalStorageErrorCode code,
+    int system_error = 0,
+    std::optional<JournalCodecError> codec_error = std::nullopt);
+
+[[nodiscard]] std::optional<std::size_t> append_write_size_before_failure(
+    std::size_t requested_size) {
+    std::lock_guard lock(append_io_test_state.mutex);
+    if (!append_io_test_state.fail_after_successful_bytes.has_value()) {
+        return requested_size;
+    }
+    const std::size_t limit = *append_io_test_state.fail_after_successful_bytes;
+    if (append_io_test_state.successful_append_bytes >= limit) {
+        return std::nullopt;
+    }
+    return std::min(requested_size, limit - append_io_test_state.successful_append_bytes);
+}
+
+void record_successful_append_write(std::size_t byte_count) {
+    std::lock_guard lock(append_io_test_state.mutex);
+    append_io_test_state.successful_append_bytes += byte_count;
+}
+
+[[nodiscard]] std::optional<JournalStorageError> append_path_sync(int file_descriptor) {
+    {
+        std::lock_guard lock(append_io_test_state.mutex);
+        if (append_io_test_state.fail_next_sync) {
+            append_io_test_state.fail_next_sync = false;
+            return make_error(JournalStorageErrorCode::SyncFailed, EIO);
+        }
+    }
+    if (::fsync(file_descriptor) != 0) {
+        return make_error(JournalStorageErrorCode::SyncFailed, errno);
+    }
+    {
+        std::lock_guard lock(append_io_test_state.mutex);
+        ++append_io_test_state.successful_append_sync_count;
+    }
+    return std::nullopt;
+}
 
 class FileDescriptor {
 public:
@@ -61,8 +118,8 @@ private:
 
 [[nodiscard]] JournalStorageError make_error(
     JournalStorageErrorCode code,
-    int system_error = 0,
-    std::optional<JournalCodecError> codec_error = std::nullopt) {
+    int system_error,
+    std::optional<JournalCodecError> codec_error) {
     return JournalStorageError{
         .code = code,
         .system_error = system_error == 0
@@ -81,14 +138,26 @@ private:
 
 [[nodiscard]] std::optional<JournalStorageError> write_all(
     int file_descriptor,
-    std::span<const std::byte> bytes) {
+    std::span<const std::byte> bytes,
+    bool append_path = false) {
     std::size_t written = 0;
     while (written < bytes.size()) {
         const auto* data = bytes.data() + written;
         const std::size_t remaining = bytes.size() - written;
-        const ssize_t result = ::write(file_descriptor, data, remaining);
+        std::size_t write_size = remaining;
+        const bool test_io_active = append_path && append_io_test_active.load(std::memory_order_acquire);
+        if (test_io_active) {
+            const auto allowed = append_write_size_before_failure(remaining);
+            if (!allowed.has_value()) {
+                return make_error(JournalStorageErrorCode::WriteFailed, EIO);
+            }
+            write_size = *allowed;
+        }
+        const ssize_t result = ::write(file_descriptor, data, write_size);
         if (result > 0) {
-            written += static_cast<std::size_t>(result);
+            const auto successful = static_cast<std::size_t>(result);
+            written += successful;
+            if (test_io_active) record_successful_append_write(successful);
             continue;
         }
         if (result == 0) {
@@ -362,34 +431,82 @@ std::variant<JournalWriter, JournalStorageError> JournalWriter::repair_truncated
 }
 
 JournalAppendResult JournalWriter::append_and_sync(const JournalCommand& command) {
+    const std::array<JournalCommand, 1> commands{command};
+    JournalAppendBatchResult result = append_batch_and_sync(commands);
+    if (const auto* error = std::get_if<JournalStorageError>(&result)) {
+        return *error;
+    }
+    return std::get<std::vector<JournalSequence>>(result).front();
+}
+
+JournalAppendBatchResult JournalWriter::append_batch_and_sync(
+    std::span<const JournalCommand> commands) {
     if (failed_) {
         return make_error(JournalStorageErrorCode::WriterFailed);
+    }
+    if (commands.empty()) {
+        return make_error(JournalStorageErrorCode::EmptyBatch);
     }
     if (!next_sequence_.has_value()) {
         return make_error(JournalStorageErrorCode::SequenceExhausted);
     }
 
-    const JournalSequence assigned_sequence = *next_sequence_;
-    const EncodedJournalRecord encoded = encode_record(assigned_sequence, command);
-    if (const auto* codec_error = std::get_if<JournalCodecError>(&encoded)) {
-        return make_error(JournalStorageErrorCode::CodecFailure, 0, *codec_error);
-    }
-    const std::vector<std::byte>& bytes = std::get<std::vector<std::byte>>(encoded);
-    if (const auto write_error = write_all(file_descriptor_, bytes)) {
-        failed_ = true;
-        return *write_error;
-    }
-    if (::fsync(file_descriptor_) != 0) {
-        failed_ = true;
-        return make_error(JournalStorageErrorCode::SyncFailed, errno);
+    const std::uint64_t first_sequence = next_sequence_->value;
+    const std::uint64_t available = std::numeric_limits<std::uint64_t>::max() - first_sequence + 1U;
+    if (commands.size() > available) {
+        return make_error(JournalStorageErrorCode::SequenceExhausted);
     }
 
-    if (assigned_sequence.value == std::numeric_limits<std::uint64_t>::max()) {
-        next_sequence_.reset();
-    } else {
-        next_sequence_ = JournalSequence{assigned_sequence.value + 1U};
+    try {
+        std::vector<std::vector<std::byte>> encoded_frames;
+        std::vector<JournalSequence> assigned_sequences;
+        encoded_frames.reserve(commands.size());
+        assigned_sequences.reserve(commands.size());
+        std::size_t total_size = 0;
+        for (std::size_t index = 0; index < commands.size(); ++index) {
+            const JournalSequence sequence{first_sequence + static_cast<std::uint64_t>(index)};
+            const EncodedJournalRecord encoded = encode_record(sequence, commands[index]);
+            if (const auto* codec_error = std::get_if<JournalCodecError>(&encoded)) {
+                return make_error(JournalStorageErrorCode::CodecFailure, 0, *codec_error);
+            }
+            std::vector<std::byte> frame = std::get<std::vector<std::byte>>(encoded);
+            if (frame.size() > std::numeric_limits<std::size_t>::max() - total_size) {
+                return make_error(JournalStorageErrorCode::CodecFailure);
+            }
+            total_size += frame.size();
+            assigned_sequences.push_back(sequence);
+            encoded_frames.push_back(std::move(frame));
+        }
+
+        // Deliberately retain one frame write per command. The experiment only
+        // amortizes fsync; it does not introduce write coalescing.
+        for (const std::vector<std::byte>& frame : encoded_frames) {
+            if (const auto write_error = write_all(file_descriptor_, frame, true)) {
+                failed_ = true;
+                return *write_error;
+            }
+        }
+        const auto sync_error = append_io_test_active.load(std::memory_order_acquire)
+                                    ? append_path_sync(file_descriptor_)
+                                    : (::fsync(file_descriptor_) == 0
+                                           ? std::optional<JournalStorageError>{}
+                                           : std::optional<JournalStorageError>{make_error(
+                                                 JournalStorageErrorCode::SyncFailed, errno)});
+        if (sync_error.has_value()) {
+            failed_ = true;
+            return *sync_error;
+        }
+
+        if (commands.size() == available) {
+            next_sequence_.reset();
+        } else {
+            next_sequence_ = JournalSequence{first_sequence + static_cast<std::uint64_t>(commands.size())};
+        }
+        return assigned_sequences;
+    } catch (...) {
+        // Preparation did not write any frame when this path is reached.
+        return make_error(JournalStorageErrorCode::CodecFailure);
     }
-    return assigned_sequence;
 }
 
 std::optional<JournalSequence> JournalWriter::next_sequence() const noexcept {
@@ -399,5 +516,36 @@ std::optional<JournalSequence> JournalWriter::next_sequence() const noexcept {
 bool JournalWriter::failed() const noexcept {
     return failed_;
 }
+
+namespace testing {
+
+void JournalStorageTestAccess::reset_append_io() {
+    std::lock_guard lock(append_io_test_state.mutex);
+    append_io_test_state.fail_after_successful_bytes.reset();
+    append_io_test_state.fail_next_sync = false;
+    append_io_test_state.successful_append_sync_count = 0;
+    append_io_test_state.successful_append_bytes = 0;
+    append_io_test_active.store(true, std::memory_order_release);
+}
+
+void JournalStorageTestAccess::fail_append_write_after(std::size_t successful_bytes) {
+    std::lock_guard lock(append_io_test_state.mutex);
+    append_io_test_state.fail_after_successful_bytes = successful_bytes;
+    append_io_test_state.successful_append_bytes = 0;
+    append_io_test_active.store(true, std::memory_order_release);
+}
+
+void JournalStorageTestAccess::fail_next_append_sync() {
+    std::lock_guard lock(append_io_test_state.mutex);
+    append_io_test_state.fail_next_sync = true;
+    append_io_test_active.store(true, std::memory_order_release);
+}
+
+std::size_t JournalStorageTestAccess::successful_append_sync_count() {
+    std::lock_guard lock(append_io_test_state.mutex);
+    return append_io_test_state.successful_append_sync_count;
+}
+
+} // namespace testing
 
 } // namespace matching

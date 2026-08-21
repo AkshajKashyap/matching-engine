@@ -2,6 +2,7 @@
 
 #include "exchange_server_test_access.hpp"
 #include "gateway_server_test_access.hpp"
+#include "journal_storage_test_access.hpp"
 
 #include <algorithm>
 #include <array>
@@ -40,6 +41,7 @@ using namespace std::chrono_literals;
 class ExchangeServerTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        testing::JournalStorageTestAccess::reset_append_io();
         std::array<char, 64> template_path{};
         constexpr char pattern[] = "/tmp/matching-engine-exchange-XXXXXX";
         std::memcpy(template_path.data(), pattern, sizeof(pattern));
@@ -50,7 +52,9 @@ protected:
 
     void TearDown() override {
         testing::ExchangeServerTestAccess::clear_before_execute_hook();
+        testing::ExchangeServerTestAccess::clear_before_batch_drain_hook();
         testing::GatewayServerTestAccess::clear_before_response_drain_hook();
+        testing::JournalStorageTestAccess::reset_append_io();
         if (server_.has_value()) {
             stop(*server_);
         }
@@ -617,6 +621,69 @@ TEST_F(ExchangeServerTest, PersistenceFailureFailsStopAndCompletesAlreadyAdmitte
     ::close(client);
     stop(server);
     testing::ExchangeServerTestAccess::clear_before_execute_hook();
+
+    const JournalScanResult scan_result = JournalReader::scan(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<JournalScan>(scan_result));
+    EXPECT_TRUE(std::get<JournalScan>(scan_result).records.empty());
+    auto recovered = DurableEngine::recover(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<DurableEngine>(recovered));
+    EXPECT_EQ(std::get<DurableEngine>(recovered).order_book().active_order_count(), 0U);
+}
+
+TEST_F(ExchangeServerTest, FailedDurableBatchAndLaterAdmissionsCompleteExactlyOnceAndReleaseReservations) {
+    ExchangeServerConfig config;
+    config.max_durable_batch_size = 3;
+    std::promise<void> first_dequeue_started;
+    const std::shared_future<void> started = first_dequeue_started.get_future().share();
+    std::latch release_batch_drain{1};
+    std::atomic<bool> block_once{true};
+    testing::ExchangeServerTestAccess::set_before_batch_drain_hook([&] {
+        if (block_once.exchange(false)) {
+            first_dequeue_started.set_value();
+            release_batch_drain.wait();
+        }
+    });
+    ExchangeServer& server = start(config);
+    const int client = connect_client(server);
+    send_all(client, submit(RequestId{1}, OrderId{1}, static_cast<std::uint8_t>(Side::Buy), 90, 1));
+    ASSERT_EQ(started.wait_for(1s), std::future_status::ready);
+    std::vector<std::byte> remaining_requests;
+    for (std::uint64_t id = 2; id <= 3; ++id) {
+        const auto request = submit(RequestId{id}, OrderId{id}, static_cast<std::uint8_t>(Side::Buy), 90, 1);
+        remaining_requests.insert(remaining_requests.end(), request.begin(), request.end());
+    }
+    send_all(client, remaining_requests);
+    const int disconnected_client = connect_client(server);
+    send_all(disconnected_client, submit(RequestId{4}, OrderId{4}, static_cast<std::uint8_t>(Side::Buy), 90, 1));
+    ::close(disconnected_client);
+    ASSERT_EQ(await_stats(server, [](const auto& stats) { return stats.in_flight == 4U; }).in_flight, 4U);
+    testing::JournalStorageTestAccess::fail_append_write_after(0U);
+    release_batch_drain.count_down();
+
+    const auto responses = receive_responses(client, 3);
+    ASSERT_EQ(responses.size(), 3U);
+    for (const auto& response : responses) {
+        EXPECT_TRUE(std::holds_alternative<EngineUnavailableResponse>(response.message));
+    }
+    EXPECT_EQ(await_stats(server, [](const auto& stats) { return stats.in_flight == 0U; }).in_flight, 0U);
+    const auto bounded = testing::ExchangeServerTestAccess::stats(server);
+    EXPECT_LE(bounded.request_queue_size, bounded.request_queue_capacity);
+    EXPECT_LE(bounded.response_queue_size, bounded.response_queue_capacity);
+    ::close(client);
+
+    server.request_stop();
+    ASSERT_TRUE(gateway_thread_.has_value());
+    gateway_thread_->join();
+    gateway_thread_.reset();
+    const auto batch_stats = testing::ExchangeServerTestAccess::batch_stats(server);
+    EXPECT_EQ(batch_stats.commands_processed, 4U);
+    EXPECT_EQ(batch_stats.batches_processed, 2U);
+    ASSERT_GT(batch_stats.batch_size_histogram.size(), 3U);
+    EXPECT_EQ(batch_stats.batch_size_histogram[3], 1U);
+    EXPECT_EQ(batch_stats.batch_size_histogram[1], 1U);
+    server_.reset();
+    testing::ExchangeServerTestAccess::clear_before_batch_drain_hook();
+    testing::JournalStorageTestAccess::reset_append_io();
 
     const JournalScanResult scan_result = JournalReader::scan(journal_path_);
     ASSERT_TRUE(std::holds_alternative<JournalScan>(scan_result));

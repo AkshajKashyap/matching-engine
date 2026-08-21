@@ -21,6 +21,8 @@
 
 #include <gtest/gtest.h>
 
+#include "journal_storage_test_access.hpp"
+#include "matching/durable_engine.hpp"
 #include "matching/journal_storage.hpp"
 
 namespace matching {
@@ -120,6 +122,7 @@ void expect_storage_error(const Result& result, JournalStorageErrorCode expected
 class JournalStorageTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        testing::JournalStorageTestAccess::reset_append_io();
         std::array<char, 64> template_path{};
         constexpr char kPattern[] = "/tmp/matching-engine-journal-XXXXXX";
         std::copy(std::begin(kPattern), std::end(kPattern), template_path.begin());
@@ -130,6 +133,7 @@ protected:
     }
 
     void TearDown() override {
+        testing::JournalStorageTestAccess::reset_append_io();
         std::error_code error;
         std::filesystem::remove_all(temporary_directory_, error);
         EXPECT_FALSE(error);
@@ -410,6 +414,152 @@ TEST_F(JournalStorageTest, FailedWriteDoesNotReportSuccessAndPermanentlyFailsWri
     expect_storage_error(
         writer.append_and_sync(submit_command(1, Side::Buy, 100, 1)),
         JournalStorageErrorCode::WriterFailed);
+}
+
+TEST_F(JournalStorageTest, BatchAppendPreservesFrameOrderAndContinuesWithSingleAppend) {
+    const std::array<JournalCommand, 3> batch{
+        submit_command(1, Side::Buy, 100, 2),
+        JournalCommand{CancelOrderCommand{.order_id = OrderId{1}}},
+        submit_command(2, Side::Sell, 101, 3),
+    };
+    auto created = JournalWriter::create(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<JournalWriter>(created));
+    JournalWriter writer = std::move(std::get<JournalWriter>(created));
+
+    const JournalAppendBatchResult appended = writer.append_batch_and_sync(batch);
+    ASSERT_TRUE(std::holds_alternative<std::vector<JournalSequence>>(appended));
+    const auto& sequences = std::get<std::vector<JournalSequence>>(appended);
+    ASSERT_EQ(sequences.size(), batch.size());
+    EXPECT_EQ(sequences[0], JournalSequence{1});
+    EXPECT_EQ(sequences[1], JournalSequence{2});
+    EXPECT_EQ(sequences[2], JournalSequence{3});
+    ASSERT_TRUE(std::holds_alternative<JournalSequence>(writer.append_and_sync(
+        submit_command(3, Side::Buy, 99, 1))));
+
+    const JournalScanResult scan_result = JournalReader::scan(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<JournalScan>(scan_result));
+    const auto& records = std::get<JournalScan>(scan_result).records;
+    ASSERT_EQ(records.size(), std::size_t{4});
+    EXPECT_TRUE(std::holds_alternative<SubmitLimitOrderCommand>(records[0].command));
+    EXPECT_TRUE(std::holds_alternative<CancelOrderCommand>(records[1].command));
+    EXPECT_TRUE(std::holds_alternative<SubmitLimitOrderCommand>(records[2].command));
+    EXPECT_EQ(std::get<SubmitLimitOrderCommand>(records[2].command).order.id, OrderId{2});
+    EXPECT_EQ(records.back().sequence, JournalSequence{4});
+}
+
+TEST_F(JournalStorageTest, EmptyBatchWritesNothingAndDoesNotFailWriter) {
+    auto created = JournalWriter::create(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<JournalWriter>(created));
+    JournalWriter writer = std::move(std::get<JournalWriter>(created));
+    const std::vector<JournalCommand> empty;
+    const JournalAppendBatchResult result = writer.append_batch_and_sync(empty);
+    expect_storage_error(result, JournalStorageErrorCode::EmptyBatch);
+    EXPECT_FALSE(writer.failed());
+    EXPECT_EQ(read_all_or_fail(journal_path_), encode_file_header());
+}
+
+TEST_F(JournalStorageTest, AppendFaultBoundariesLeaveOnlyTheActualValidPrefixForRecovery) {
+    const std::array<JournalCommand, 3> commands{
+        submit_command(1, Side::Buy, 101, 1),
+        submit_command(2, Side::Buy, 102, 1),
+        submit_command(3, Side::Buy, 103, 1),
+    };
+    const std::array<std::size_t, 3> frame_sizes{
+        encoded_record_or_failure(JournalSequence{1}, commands[0]).size(),
+        encoded_record_or_failure(JournalSequence{2}, commands[1]).size(),
+        encoded_record_or_failure(JournalSequence{3}, commands[2]).size(),
+    };
+    struct Boundary {
+        const char* name;
+        std::size_t successful_bytes;
+        std::size_t expected_records;
+        bool expected_torn_tail;
+    };
+    const std::array boundaries{
+        Boundary{"before_any_frame", 0U, 0U, false},
+        Boundary{"inside_first_frame", frame_sizes[0] / 2U, 0U, true},
+        Boundary{"after_one_complete_frame", frame_sizes[0], 1U, false},
+        Boundary{"after_multiple_complete_frames", frame_sizes[0] + frame_sizes[1], 2U, false},
+        Boundary{"inside_final_frame", frame_sizes[0] + frame_sizes[1] + frame_sizes[2] / 2U, 2U, true},
+    };
+
+    for (const Boundary& boundary : boundaries) {
+        SCOPED_TRACE(boundary.name);
+        const std::filesystem::path path = temporary_directory_ / (std::string(boundary.name) + ".bin");
+        {
+            auto created = JournalWriter::create(path);
+            ASSERT_TRUE(std::holds_alternative<JournalWriter>(created));
+            JournalWriter writer = std::move(std::get<JournalWriter>(created));
+            testing::JournalStorageTestAccess::fail_append_write_after(boundary.successful_bytes);
+            expect_storage_error(writer.append_batch_and_sync(commands), JournalStorageErrorCode::WriteFailed);
+            EXPECT_TRUE(writer.failed());
+            ASSERT_TRUE(writer.next_sequence().has_value());
+            EXPECT_EQ(*writer.next_sequence(), JournalSequence{1});
+            expect_storage_error(writer.append_and_sync(commands[0]), JournalStorageErrorCode::WriterFailed);
+        }
+
+        const JournalScanResult before_recovery = JournalReader::scan(path);
+        ASSERT_TRUE(std::holds_alternative<JournalScan>(before_recovery));
+        const JournalScan& scan = std::get<JournalScan>(before_recovery);
+        EXPECT_EQ(scan.records.size(), boundary.expected_records);
+        EXPECT_EQ(scan.has_truncated_tail, boundary.expected_torn_tail);
+
+        auto recovered_result = DurableEngine::recover(path);
+        ASSERT_TRUE(std::holds_alternative<DurableEngine>(recovered_result));
+        DurableEngine recovered = std::move(std::get<DurableEngine>(recovered_result));
+        EXPECT_EQ(recovered.order_book().active_order_count(), boundary.expected_records);
+        const JournalScanResult repaired_scan = JournalReader::scan(path);
+        ASSERT_TRUE(std::holds_alternative<JournalScan>(repaired_scan));
+        EXPECT_FALSE(std::get<JournalScan>(repaired_scan).has_truncated_tail);
+        EXPECT_EQ(std::get<JournalScan>(repaired_scan).records.size(), boundary.expected_records);
+        testing::JournalStorageTestAccess::reset_append_io();
+    }
+}
+
+TEST_F(JournalStorageTest, FsyncFailureAfterAllFramesLeavesCompleteUnacknowledgedBatchRecoverable) {
+    const std::array<JournalCommand, 3> commands{
+        submit_command(1, Side::Buy, 101, 1),
+        submit_command(2, Side::Buy, 102, 1),
+        submit_command(3, Side::Buy, 103, 1),
+    };
+    {
+        auto created = JournalWriter::create(journal_path_);
+        ASSERT_TRUE(std::holds_alternative<JournalWriter>(created));
+        JournalWriter writer = std::move(std::get<JournalWriter>(created));
+        testing::JournalStorageTestAccess::fail_next_append_sync();
+        expect_storage_error(writer.append_batch_and_sync(commands), JournalStorageErrorCode::SyncFailed);
+        EXPECT_TRUE(writer.failed());
+        ASSERT_TRUE(writer.next_sequence().has_value());
+        EXPECT_EQ(*writer.next_sequence(), JournalSequence{1});
+        expect_storage_error(writer.append_and_sync(commands[0]), JournalStorageErrorCode::WriterFailed);
+    }
+    const JournalScanResult scan_result = JournalReader::scan(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<JournalScan>(scan_result));
+    EXPECT_FALSE(std::get<JournalScan>(scan_result).has_truncated_tail);
+    EXPECT_EQ(std::get<JournalScan>(scan_result).records.size(), commands.size());
+    auto recovered_result = DurableEngine::recover(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<DurableEngine>(recovered_result));
+    EXPECT_EQ(std::get<DurableEngine>(recovered_result).order_book().active_order_count(), commands.size());
+}
+
+TEST_F(JournalStorageTest, EveryNonEmptyBatchUsesExactlyOneAppendPathFsync) {
+    auto created = JournalWriter::create(journal_path_);
+    ASSERT_TRUE(std::holds_alternative<JournalWriter>(created));
+    JournalWriter writer = std::move(std::get<JournalWriter>(created));
+    testing::JournalStorageTestAccess::reset_append_io();
+    const std::array<JournalCommand, 1> one{submit_command(1, Side::Buy, 100, 1)};
+    const std::array<JournalCommand, 2> two{
+        submit_command(2, Side::Buy, 101, 1), submit_command(3, Side::Buy, 102, 1)};
+    std::array<JournalCommand, 8> eight{};
+    for (std::size_t index = 0; index < eight.size(); ++index) {
+        eight[index] = submit_command(4U + index, Side::Buy, 103U + index, 1);
+    }
+    ASSERT_TRUE(std::holds_alternative<std::vector<JournalSequence>>(writer.append_batch_and_sync(one)));
+    EXPECT_EQ(testing::JournalStorageTestAccess::successful_append_sync_count(), 1U);
+    ASSERT_TRUE(std::holds_alternative<std::vector<JournalSequence>>(writer.append_batch_and_sync(two)));
+    EXPECT_EQ(testing::JournalStorageTestAccess::successful_append_sync_count(), 2U);
+    ASSERT_TRUE(std::holds_alternative<std::vector<JournalSequence>>(writer.append_batch_and_sync(eight)));
+    EXPECT_EQ(testing::JournalStorageTestAccess::successful_append_sync_count(), 3U);
 }
 
 } // namespace

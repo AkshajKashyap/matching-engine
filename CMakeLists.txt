@@ -122,6 +122,7 @@ if(MATCHING_ENGINE_BUILD_BENCHMARKS)
         benchmarks/network_exchange_benchmark.cpp
     )
     target_link_libraries(network_exchange_benchmark PRIVATE matching_gateway Threads::Threads)
+    target_include_directories(network_exchange_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     enable_project_warnings(network_exchange_benchmark)
     enable_project_sanitizers(network_exchange_benchmark)
     enable_project_thread_sanitizer(network_exchange_benchmark)

@@ -3,17 +3,22 @@
 #include "exchange_server_test_access.hpp"
 
 #include <exception>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace matching {
 namespace {
 
 std::mutex test_hook_mutex;
 std::function<void()> before_execute_hook;
+std::mutex batch_drain_hook_mutex;
+std::function<void()> before_batch_drain_hook;
+std::atomic<bool> batch_drain_hook_active{false};
 
 void run_before_execute_hook() {
     std::function<void()> hook;
@@ -24,6 +29,16 @@ void run_before_execute_hook() {
     if (hook) {
         hook();
     }
+}
+
+void run_before_batch_drain_hook() {
+    if (!batch_drain_hook_active.load(std::memory_order_acquire)) return;
+    std::function<void()> hook;
+    {
+        std::lock_guard lock(batch_drain_hook_mutex);
+        hook = before_batch_drain_hook;
+    }
+    if (hook) hook();
 }
 
 [[nodiscard]] EngineResponse unavailable_response(const EngineRequest& request) noexcept {
@@ -41,7 +56,8 @@ public:
           in_flight_limiter(config.maximum_in_flight),
           request_queue(config.request_queue_capacity),
           response_queue(response_queue_capacity_for(config.maximum_in_flight)),
-          engine(std::move(engine_in)) {}
+          engine(std::move(engine_in)),
+          batch_size_histogram(config.request_queue_capacity + 1U) {}
 
     ~Impl() {
         request_queue.close();
@@ -69,6 +85,9 @@ public:
     std::optional<GatewayServer> gateway;
     std::jthread worker;
     bool worker_started{};
+    std::size_t commands_processed{};
+    std::size_t batches_processed{};
+    std::vector<std::size_t> batch_size_histogram;
 
 private:
     void publish(EngineCompletion completion) noexcept {
@@ -78,31 +97,72 @@ private:
         gateway->notify();
     }
 
-    [[nodiscard]] EngineResponse execute(const EngineRequest& request, bool& failed) noexcept {
-        if (failed) return unavailable_response(request);
-        try {
-            run_before_execute_hook();
-            return std::visit([this, &failed](const auto& value) -> EngineResponse {
-                using Request = std::decay_t<decltype(value)>;
-                if constexpr (std::is_same_v<Request, SubmitEngineRequest>) {
-                    const DurableEngine::SubmitCommandResult result = engine.submit(value.order);
-                    if (const auto* submit = std::get_if<SubmitResult>(&result)) {
-                        return summarize_submit_result(value.connection_id, value.request_id, *submit);
-                    }
+    [[nodiscard]] static JournalCommand to_journal_command(const EngineRequest& request) noexcept {
+        return std::visit([](const auto& value) -> JournalCommand {
+            using Request = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Request, SubmitEngineRequest>) {
+                return SubmitLimitOrderCommand{.order = value.order};
+            } else {
+                return CancelOrderCommand{.order_id = value.order_id};
+            }
+        }, request);
+    }
+
+    [[nodiscard]] static EngineResponse summarize(
+        const EngineRequest& request,
+        const DurableEngine::BatchCommandResult& result) noexcept {
+        return std::visit([&request](const auto& value) -> EngineResponse {
+            using Result = std::decay_t<decltype(value)>;
+            return std::visit([&value](const auto& request_value) -> EngineResponse {
+                using Request = std::decay_t<decltype(request_value)>;
+                if constexpr (std::is_same_v<Result, SubmitResult> && std::is_same_v<Request, SubmitEngineRequest>) {
+                    return summarize_submit_result(request_value.connection_id, request_value.request_id, value);
+                } else if constexpr (std::is_same_v<Result, CancelResult> && std::is_same_v<Request, CancelEngineRequest>) {
+                    return summarize_cancel_result(request_value.connection_id, request_value.request_id, value);
                 } else {
-                    const DurableEngine::CancelCommandResult result = engine.cancel(value.order_id);
-                    if (const auto* cancel = std::get_if<CancelResult>(&result)) {
-                        return summarize_cancel_result(value.connection_id, value.request_id, *cancel);
-                    }
+                    std::terminate();
                 }
-                failed = true;
-                gateway->enter_fail_stop();
-                return unavailable_response(EngineRequest{value});
             }, request);
+        }, result);
+    }
+
+    void execute_and_publish_batch(std::vector<AdmittedEngineRequest> batch, bool& failed) noexcept {
+        ++batches_processed;
+        commands_processed += batch.size();
+        ++batch_size_histogram[batch.size()];
+        if (failed) {
+            for (AdmittedEngineRequest& admitted : batch) {
+                publish(EngineCompletion{.response = unavailable_response(admitted.request), .completion = std::move(admitted.completion)});
+            }
+            return;
+        }
+        try {
+            std::vector<JournalCommand> commands;
+            commands.reserve(batch.size());
+            for (const AdmittedEngineRequest& admitted : batch) commands.push_back(to_journal_command(admitted.request));
+            run_before_execute_hook();
+            DurableEngine::BatchResult result = engine.execute_batch(commands);
+            if (const auto* results = std::get_if<std::vector<DurableEngine::BatchCommandResult>>(&result)) {
+                if (results->size() != batch.size()) std::terminate();
+                for (std::size_t index = 0; index < batch.size(); ++index) {
+                    publish(EngineCompletion{
+                        .response = summarize(batch[index].request, (*results)[index]),
+                        .completion = std::move(batch[index].completion),
+                    });
+                }
+                return;
+            }
+            failed = true;
+            gateway->enter_fail_stop();
+            for (AdmittedEngineRequest& admitted : batch) {
+                publish(EngineCompletion{.response = unavailable_response(admitted.request), .completion = std::move(admitted.completion)});
+            }
         } catch (...) {
             failed = true;
             gateway->enter_fail_stop();
-            return unavailable_response(request);
+            for (AdmittedEngineRequest& admitted : batch) {
+                publish(EngineCompletion{.response = unavailable_response(admitted.request), .completion = std::move(admitted.completion)});
+            }
         }
     }
 
@@ -110,10 +170,16 @@ private:
         bool failed = false;
         try {
             while (std::optional<AdmittedEngineRequest> admitted = request_queue.wait_pop()) {
-                publish(EngineCompletion{
-                    .response = execute(admitted->request, failed),
-                    .completion = std::move(admitted->completion),
-                });
+                std::vector<AdmittedEngineRequest> batch;
+                batch.reserve(config.max_durable_batch_size);
+                batch.push_back(std::move(*admitted));
+                run_before_batch_drain_hook();
+                while (batch.size() < config.max_durable_batch_size) {
+                    std::optional<AdmittedEngineRequest> next = request_queue.try_pop();
+                    if (!next.has_value()) break;
+                    batch.push_back(std::move(*next));
+                }
+                execute_and_publish_batch(std::move(batch), failed);
             }
         } catch (...) {
             failed = true;
@@ -139,7 +205,8 @@ ExchangeServer::CreateResult ExchangeServer::create(
     ExchangeServerConfig config,
     const std::filesystem::path& journal_path,
     ExchangeStartupMode startup_mode) {
-    if (config.maximum_in_flight == 0 || config.request_queue_capacity == 0) {
+    if (config.maximum_in_flight == 0 || config.request_queue_capacity == 0 ||
+        config.max_durable_batch_size == 0) {
         return ExchangeServerError{.code = ExchangeServerErrorCode::InvalidConfiguration};
     }
     DurableEngine::CreateResult engine_result = startup_mode == ExchangeStartupMode::CreateNew
@@ -187,6 +254,16 @@ ExchangeServerRuntimeStats ExchangeServerTestAccess::stats(const ExchangeServer&
     };
 }
 
+ExchangeBatchStats ExchangeServerTestAccess::batch_stats(const ExchangeServer& server) {
+    if (server.impl_ == nullptr) return {};
+    const ExchangeServer::Impl& impl = *server.impl_;
+    return ExchangeBatchStats{
+        .commands_processed = impl.commands_processed,
+        .batches_processed = impl.batches_processed,
+        .batch_size_histogram = impl.batch_size_histogram,
+    };
+}
+
 void ExchangeServerTestAccess::set_before_execute_hook(std::function<void()> hook) {
     std::lock_guard lock(test_hook_mutex);
     before_execute_hook = std::move(hook);
@@ -195,6 +272,18 @@ void ExchangeServerTestAccess::set_before_execute_hook(std::function<void()> hoo
 void ExchangeServerTestAccess::clear_before_execute_hook() {
     std::lock_guard lock(test_hook_mutex);
     before_execute_hook = {};
+}
+
+void ExchangeServerTestAccess::set_before_batch_drain_hook(std::function<void()> hook) {
+    std::lock_guard lock(batch_drain_hook_mutex);
+    before_batch_drain_hook = std::move(hook);
+    batch_drain_hook_active.store(static_cast<bool>(before_batch_drain_hook), std::memory_order_release);
+}
+
+void ExchangeServerTestAccess::clear_before_batch_drain_hook() {
+    std::lock_guard lock(batch_drain_hook_mutex);
+    before_batch_drain_hook = {};
+    batch_drain_hook_active.store(false, std::memory_order_release);
 }
 
 } // namespace testing

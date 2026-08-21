@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -40,6 +41,8 @@ public:
     using CreateResult = std::variant<DurableEngine, DurableEngineError>;
     using SubmitCommandResult = std::variant<SubmitResult, DurableEngineError>;
     using CancelCommandResult = std::variant<CancelResult, DurableEngineError>;
+    using BatchCommandResult = std::variant<SubmitResult, CancelResult>;
+    using BatchResult = std::variant<std::vector<BatchCommandResult>, DurableEngineError>;
 
     // Creates a new journal exclusively and pairs it with an empty OrderBook.
     [[nodiscard]] static CreateResult create(const std::filesystem::path& path);
@@ -50,6 +53,10 @@ public:
     // Persists and fsyncs the command before applying it to the OrderBook.
     [[nodiscard]] SubmitCommandResult submit(NewLimitOrder order);
     [[nodiscard]] CancelCommandResult cancel(OrderId id);
+
+    // Persists every command with one durability barrier, then applies the
+    // commands in input order. A successful result has one entry per command.
+    [[nodiscard]] BatchResult execute_batch(std::span<const JournalCommand> commands);
 
     [[nodiscard]] const OrderBook& order_book() const noexcept;
     [[nodiscard]] DurableEngineState state() const noexcept;
